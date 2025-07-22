@@ -1,53 +1,93 @@
-name: Create VPS
+# .github/workflows/create-vps.yml
+name: Create and Renew VPS with Discord Notification
 
 on:
-  workflow_dispatch:          # ✅ Manual "Run workflow" button
-  repository_dispatch:        # ✅ Can still be triggered by API or other workflows
-    types: [create-vps]
+  workflow_dispatch: # Manual "Run workflow" button
+  schedule:
+    # Har 6 ghante mein automatically run hoga
+    - cron: '0 */6 * * *'
 
 jobs:
   start-vps:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6 hours max
+    # Timeout ko 6 ghante se thoda kam rakhein taaki cleanup step chal sake
+    timeout-minutes: 355 
 
     steps:
-      - name: ⬇️ Checkout
-        uses: actions/checkout@v3
+      - name: ⬇️ Checkout code
+        uses: actions/checkout@v4
 
-      - name: 📁 Create dirs
-        run: mkdir -p links .backup
-
-      - name: 💾 Restore backup
+      - name: ⚙️ System dependencies install karna
         run: |
-          name="${{ github.event.client_payload.vps_name }}"
-          if [ "${{ github.event.client_payload.backup }}" == "true" ]; then
-            echo "📦 Restoring backup..."
-            unzip ".backup/$name.zip" -d . || echo "⚠️ No backup to restore."
-          fi
+          sudo apt-get update
+          sudo apt-get install -y tmate sshpass jq
 
-      - name: 🔐 Start tmate session
+      - name: 🚀 tmate session shuru karna
+        id: tmate # Step ko ek ID de rahe hain taaki output use kar sakein
         run: |
-          echo "⚙️ Launching tmate..."
-          sudo apt update && sudo apt install -y tmate
           tmate -S /tmp/tmate.sock new-session -d
           tmate -S /tmp/tmate.sock wait tmate-ready
-          SSH=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}')
-          echo "$SSH" > "links/${{ github.event.client_payload.vps_name || 'manual-vps' }}.txt"
-          echo "✅ SSH Ready: $SSH"
-          sleep 60  # give time for GitHub to sync
+          
+          # SSH connection string ko GITHUB_OUTPUT mein save karna
+          TMATE_SSH=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}')
+          echo "ssh_connection=${TMATE_SSH}" >> $GITHUB_OUTPUT
+          
+          echo "✅ SSH Session taiyar hai!"
+          echo "$TMATE_SSH"
 
-      - name: 📦 Save backup
+      - name: 💬 Discord par DM bhejna
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_USER_ID: ${{ secrets.DISCORD_USER_ID }}
+          SSH_CONNECTION: ${{ steps.tmate.outputs.ssh_connection }}
         run: |
-          name="${{ github.event.client_payload.vps_name || 'manual-vps' }}"
-          zip -r ".backup/$name.zip" . -x ".git/*" ".github/*" ".backup/*" || true
+          # Agar secrets set nahi hain to step skip karein
+          if [ -z "$DISCORD_BOT_TOKEN" ] || [ -z "$DISCORD_USER_ID" ]; then
+            echo "⚠️ Discord secrets set nahi hain. DM nahi bhej sakte."
+            exit 0
+          fi
 
-      - name: 📤 Push
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "🔁 Updated SSH + backup for ${{ github.event.client_payload.vps_name || 'manual-vps' }}"
-          file_pattern: 'links/*.txt .backup/*.zip'
+          echo "DM channel banaya ja raha hai..."
+          # Pehle user ke saath ek DM channel create karein
+          CHANNEL_DATA=$(curl -s -X POST \
+            -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"recipient_id\":\"$DISCORD_USER_ID\"}" \
+            https://discord.com/api/v10/users/@me/channels)
+          
+          # Response se channel ID nikalein
+          CHANNEL_ID=$(echo "$CHANNEL_DATA" | jq -r '.id')
 
-      - name: ⏳ Keep session alive
+          if [ -z "$CHANNEL_ID" ] || [ "$CHANNEL_ID" == "null" ]; then
+              echo "❌ Discord DM channel banane mein fail hua. Response:"
+              echo "$CHANNEL_DATA"
+              exit 1
+          fi
+          
+          echo "✅ DM Channel ID: $CHANNEL_ID"
+          echo "Naya SSH link DM kiya ja raha hai..."
+
+          # Ab uss channel par message bhejein
+          curl -s -X POST \
+            -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\":\"🚀 Aapka naya VPS taiyar hai!\\n\\nSSH Connection Link:\\n\`\`\`${SSH_CONNECTION}\`\`\`\"}" \
+            https://discord.com/api/v10/channels/$CHANNEL_ID/messages
+            
+          echo "✅ DM सफलतापूर्वक bhej diya gaya."
+
+      - name: ⏳ Session ko zinda rakhna
         run: |
-          echo "⏳ Keeping session alive for 6 hours..."
-          sleep $((360 * 60))
+          echo "⏳ Session ko lagbhag 6 ghante tak zinda rakha jayega..."
+          # Loop chala kar session ko zinda rakhein
+          end=$((SECONDS+19800)) # 5.5 ghante
+          while [ $SECONDS -lt $end ]; do
+            sleep 60
+            # Check karein ki tmate session abhi bhi chal raha hai ya nahi
+            if ! tmate -S /tmp/tmate.sock has-session; then
+              echo "Tmate session band ho gaya."
+              break
+            fi
+          done
+          echo "Session ka samay samapt hua."
+
