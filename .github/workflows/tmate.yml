@@ -1,4 +1,4 @@
-name: vps
+name: Create VPS
 
 on:
   workflow_dispatch:
@@ -6,141 +6,87 @@ on:
     types: [create-vps]
 
 jobs:
-  deploy-vps:
+  start-vps:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
     steps:
-      - name: ⬇️ Checkout repository
+      - name: ⬇️ Checkout
         uses: actions/checkout@v3
 
-      - name: 📁 Create dirs for backup & links
+      - name: 📁 Create dirs
         run: mkdir -p links .backup
 
-      - name: 💾 Restore old VPS backup if any
+      - name: 💾 Conditional Restore Backup
         run: |
           name="${{ github.event.client_payload.vps_name || 'manual-vps' }}"
-          if [ "${{ github.event.client_payload.backup }}" == "true" ]; then
-            echo "📦 Restoring backup..."
-            unzip ".backup/$name.zip" -d / || echo "⚠️ No backup to restore."
+          backup_file=".backup/$name.zip"
+          if [ -f "$backup_file" ]; then
+            echo "📦 Backup found. Restoring..."
+            unzip "$backup_file" -d . || echo "⚠️ Failed to extract backup."
+          else
+            echo "🆕 No backup found. Fresh setup initiated."
+          fi
 
-      - name: 🧱 Install dependencies & Pterodactyl Panel
-        run: |
-          echo "🚀 Installing Pterodactyl Panel..."
-          apt update -y && apt upgrade -y
-          apt install -y nginx mysql-server php php-fpm php-mysql php-cli php-curl php-mbstring php-xml php-bcmath unzip curl tar composer
-
-          # Setup MySQL
-          mysql -e "CREATE DATABASE panel;"
-          mysql -e "CREATE USER 'ptero'@'localhost' IDENTIFIED BY 'password';"
-          mysql -e "GRANT ALL PRIVILEGES ON panel.* TO 'ptero'@'localhost';"
-          mysql -e "FLUSH PRIVILEGES;"
-
-          # Download panel
-          cd /var/www
-          curl -Lo panel.tar.gz https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz
-          tar -xzvf panel.tar.gz
-          mv panel public_html
-          cd public_html
-
-          cp .env.example .env
-          composer install --no-dev --optimize-autoloader
-          php artisan key:generate --force
-          php artisan p:environment:setup --author="you@example.com" --app-url="https://${{ secrets.CF_RECORD_NAME }}" --timezone="Asia/Kolkata" --cache=true --session=true --queue=true --force
-          php artisan p:database:setup --host=127.0.0.1 --port=3306 --database=panel --username=ptero --password=password --hostport=3306 --force
-          php artisan migrate --seed --force
-          chown -R www-data:www-data /var/www/public_html
-          chmod -R 755 /var/www/public_html
-
-          # Setup Nginx
-          cat > /etc/nginx/sites-available/panel <<EOF
-          server {
-              listen 80;
-              server_name ${{ secrets.CF_RECORD_NAME }};
-              root /var/www/public_html/public;
-
-              index index.php index.html index.htm;
-
-              location / {
-                  try_files $uri $uri/ /index.php?$query_string;
-              }
-
-              location ~ \.php$ {
-                  include snippets/fastcgi-php.conf;
-                  fastcgi_pass unix:/var/run/php/php8.1-fpm.sock;
-              }
-
-              location ~ /\.ht {
-                  deny all;
-              }
-          }
-          EOF
-
-          ln -s /etc/nginx/sites-available/panel /etc/nginx/sites-enabled/
-          nginx -t && systemctl restart nginx
-
-      - name: 🌐 Setup Cloudflare Tunnel
-        run: |
-          echo "🌐 Installing and activating Cloudflare Tunnel..."
-          apt install -y cloudflared
-          cloudflared service install ${{ secrets.CF_TUNNEL_TOKEN }}
-
-      - name: 🎮 Install Minecraft Egg (Pterodactyl)
-        run: |
-          mkdir -p /var/www/public_html/pterodactyl-eggs
-          curl -Lo /var/www/public_html/pterodactyl-eggs/minecraft.json https://raw.githubusercontent.com/parkervcp/eggs/master/game_eggs/minecraft/java/vanilla.json || true
-
-      - name: 🔐 Start tmate SSH Session
-        id: tmate
+      - name: 🔐 Start tmate session
         run: |
           echo "⚙️ Launching tmate..."
-          apt install -y tmate
+          sudo apt update && sudo apt install -y tmate unzip curl zip
           tmate -S /tmp/tmate.sock new-session -d
           tmate -S /tmp/tmate.sock wait tmate-ready
           SSH=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}')
-          echo "ssh_link=$SSH" >> $GITHUB_OUTPUT
           echo "$SSH" > "links/${{ github.event.client_payload.vps_name || 'manual-vps' }}.txt"
+          echo "✅ SSH Ready: $SSH"
 
-      - name: 📦 Backup current VPS state
+      - name: 🌐 Setup Cloudflare Tunnel + Pterodactyl
+        run: |
+          if [ ! -f ".installed" ]; then
+            echo "🚀 First-time setup: Installing Pterodactyl + Tunnel"
+
+            curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+            chmod +x cloudflared
+            sudo mv cloudflared /usr/local/bin/
+            echo "Starting Cloudflare tunnel..."
+            cloudflared service install ${{ secrets.CF_TUNNEL_TOKEN }}
+
+            echo "🔧 Installing Docker, MariaDB, PHP & dependencies for Pterodactyl"
+            sudo apt update && sudo apt install -y nginx mariadb-server php php-cli php-mysql unzip curl zip git redis-server supervisor
+            curl -Lo panel.tar.gz https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz
+            mkdir -p /var/www/pterodactyl && tar -xzvf panel.tar.gz -C /var/www/pterodactyl --strip-components=1
+            cd /var/www/pterodactyl
+            cp .env.example .env
+            composer install --no-dev --optimize-autoloader
+            php artisan key:generate --force
+            php artisan p:environment:setup --email=admin@example.com --url=https://${{ secrets.CF_RECORD_NAME }}
+            php artisan p:environment:database
+            php artisan migrate --seed --force
+            php artisan p:user:make --email=admin@example.com --username=admin --name-first=Admin --name-last=User --password=StrongPassword123 --admin=1
+            touch /root/.installed
+            echo "✅ Pterodactyl Installed and Cloudflare Tunnel Active."
+          else
+            echo "🔁 Not first-time. Skipping setup."
+          fi
+
+      - name: 📦 Save backup
         run: |
           name="${{ github.event.client_payload.vps_name || 'manual-vps' }}"
-          zip -r ".backup/$name.zip" /var/www/public_html -x ".git/*" ".github/*" ".backup/*" || true
+          zip -r ".backup/$name.zip" . -x ".git/*" ".github/*" ".backup/*" || true
 
-      - name: 📤 Push backup & SSH to repo
+      - name: 📤 Push
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "🔁 Backup & SSH update for ${{ github.event.client_payload.vps_name || 'manual-vps' }}"
+          commit_message: "🔁 Updated SSH + backup for ${{ github.event.client_payload.vps_name || 'manual-vps' }}"
           file_pattern: 'links/*.txt .backup/*.zip'
 
-      - name: 📩 Discord Notification
+      - name: 📬 Send Discord Webhook
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
-          curl -H "Content-Type: application/json" \
-               -X POST \
-               -d '{
-                 "content": "✅ New VPS ready with Pterodactyl Panel\n🔐 SSH: `${{ steps.tmate.outputs.ssh_link }}`\n🌐 Domain: https://${{ secrets.CF_RECORD_NAME }}\n🕒 Will reset in 6h with auto-backup."
-               }' \
-               "$DISCORD_WEBHOOK"
+          SSH=$(cat links/${{ github.event.client_payload.vps_name || 'manual-vps' }}.txt)
+          curl -H "Content-Type: application/json" -X POST -d "{\"content\":\"🚀 New VPS Ready!\n🔐 SSH: $SSH\n🌐 Panel: https://${{ secrets.CF_RECORD_NAME }}\"}" "$DISCORD_WEBHOOK"
 
-      - name: 🕒 Keep VPS Alive
+      - name: ⏳ Keep session alive
         run: |
-          echo "⏳ VPS running for 6 hours..."
+          echo "⏳ Keeping session alive for 6 hours..."
           sleep $((360 * 60))
-
-  delete-vps:
-    if: always()
-    needs: deploy-vps
-    runs-on: ubuntu-latest
-    steps:
-      - name: 🧹 Notify and Clean Up
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-        run: |
-          curl -H "Content-Type: application/json" \
-               -X POST \
-               -d '{
-                 "content": "🧹 VPS session expired. New instance will be auto-deployed."
-               }' \
-               "$DISCORD_WEBHOOK"
-               
+          
