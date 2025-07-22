@@ -1,4 +1,4 @@
-name: Create VPS with Auto-Restore and Discord DM
+name: Create and Restore VPS with Pterodactyl & Cloudflare Auto-DNS
 
 on:
   workflow_dispatch:
@@ -22,14 +22,52 @@ jobs:
           name="${{ github.event.client_payload.vps_name || 'manual-vps' }}"
           if [ "${{ github.event.client_payload.backup }}" == "true" ]; then
             echo "📦 Restoring backup..."
-            unzip ".backup/$name.zip" -d . || echo "⚠️ No backup to restore."
-          fi
+            unzip ".backup/$name.zip" -d /root/ || echo "⚠️ No backup to restore."
+
+      - name: 🧱 Install Pterodactyl Panel
+        run: |
+          echo "🚀 Installing Pterodactyl Panel..."
+          apt update -y && apt upgrade -y
+          apt install -y nginx mysql-server php php-fpm php-mysql php-cli php-curl php-mbstring php-xml php-bcmath unzip curl tar composer
+
+          cd /var/www
+          curl -Lo panel.tar.gz https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz
+          tar -xzvf panel.tar.gz
+          cd /var/www/panel
+          cp .env.example .env
+          composer install --no-dev --optimize-autoloader
+          php artisan key:generate --force
+          php artisan p:environment:setup --force
+          php artisan p:database:setup --force
+          php artisan migrate --seed --force
+          chown -R www-data:www-data /var/www/panel
+          chmod -R 755 /var/www/panel
+          systemctl restart nginx
+
+      - name: 🌐 Setup Cloudflare DNS Record
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+          CF_RECORD_NAME: ${{ secrets.CF_RECORD_NAME }}
+        run: |
+          echo "🌐 Creating A record for domain..."
+          PUBLIC_IP=$(curl -s http://checkip.amazonaws.com)
+          curl -X POST "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records" \
+               -H "Authorization: Bearer $CF_API_TOKEN" \
+               -H "Content-Type: application/json" \
+               --data '{
+                 "type": "A",
+                 "name": "'$CF_RECORD_NAME'",
+                 "content": "'$PUBLIC_IP'",
+                 "ttl": 120,
+                 "proxied": true
+               }'
 
       - name: 🔐 Start tmate session
         id: tmate
         run: |
           echo "⚙️ Launching tmate..."
-          sudo apt update && sudo apt install -y tmate
+          sudo apt install -y tmate
           tmate -S /tmp/tmate.sock new-session -d
           tmate -S /tmp/tmate.sock wait tmate-ready
           SSH=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}')
@@ -39,12 +77,12 @@ jobs:
       - name: 📦 Save backup
         run: |
           name="${{ github.event.client_payload.vps_name || 'manual-vps' }}"
-          zip -r ".backup/$name.zip" . -x ".git/*" ".github/*" ".backup/*" || true
+          zip -r ".backup/$name.zip" /var/www/panel -x ".git/*" ".github/*" ".backup/*" || true
 
       - name: 📤 Push backup and SSH link
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "🔁 Updated SSH + backup for ${{ github.event.client_payload.vps_name || 'manual-vps' }}"
+          commit_message: "🔁 Updated SSH + Pterodactyl backup for ${{ github.event.client_payload.vps_name || 'manual-vps' }}"
           file_pattern: 'links/*.txt .backup/*.zip'
 
       - name: 📩 Send Discord DM
@@ -54,7 +92,7 @@ jobs:
           curl -H "Content-Type: application/json" \
                -X POST \
                -d '{
-                 "content": "🖥️ New VPS SSH link: `${{ steps.tmate.outputs.ssh_link }}`\n⏳ This VPS will auto-terminate in 6 hours."
+                 "content": "🖥️ New VPS with Pterodactyl is ready! SSH: `${{ steps.tmate.outputs.ssh_link }}`\n🌐 Domain: https://${{ secrets.CF_RECORD_NAME }}\n⏳ VPS will auto-recycle every 6h with backup."
                }' \
                "$DISCORD_WEBHOOK"
 
@@ -72,11 +110,11 @@ jobs:
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
-          echo "🧹 Deleting VPS..."
+          echo "🧹 VPS session expired and has been deleted."
           curl -H "Content-Type: application/json" \
                -X POST \
                -d '{
-                 "content": "🧹 VPS session expired and has been deleted."
+                 "content": "🧹 VPS session expired. New instance will be auto-redeployed."
                }' \
                "$DISCORD_WEBHOOK"
                
