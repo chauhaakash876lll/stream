@@ -11,82 +11,60 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: ⬇️ Checkout
+      - name: ⬇️ Checkout repository
         uses: actions/checkout@v3
 
-      - name: 📁 Create dirs
+      - name: 📁 Create required directories
         run: mkdir -p links .backup
 
-      - name: 💾 Conditional Restore Backup
+      - name: ⚙️ Detect and restore backup if exists
         run: |
           name="${{ github.event.client_payload.vps_name || 'manual-vps' }}"
-          backup_file=".backup/$name.zip"
-          if [ -f "$backup_file" ]; then
-            echo "📦 Backup found. Restoring..."
-            unzip "$backup_file" -d . || echo "⚠️ Failed to extract backup."
+          if [ -f ".backup/$name.zip" ]; then
+            echo "📦 Found previous backup. Restoring..."
+            unzip ".backup/$name.zip" -d /tmp/restore-data
+            sudo rsync -a /tmp/restore-data/ / --exclude='.git' || echo "⚠️ Restore failed."
           else
-            echo "🆕 No backup found. Fresh setup initiated."
+            echo "ℹ️ No backup found. Assuming first time setup."
           fi
 
-      - name: 🔐 Start tmate session
+      - name: 🔐 Start tmate SSH session
         run: |
-          echo "⚙️ Launching tmate..."
-          sudo apt update && sudo apt install -y tmate unzip curl zip
+          echo "⚙️ Launching tmate session..."
+          sudo apt update && sudo apt install -y tmate
           tmate -S /tmp/tmate.sock new-session -d
           tmate -S /tmp/tmate.sock wait tmate-ready
           SSH=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}')
           echo "$SSH" > "links/${{ github.event.client_payload.vps_name || 'manual-vps' }}.txt"
           echo "✅ SSH Ready: $SSH"
+          echo "::set-output name=ssh::$SSH"
 
-      - name: 🌐 Setup Cloudflare Tunnel + Pterodactyl
-        run: |
-          if [ ! -f ".installed" ]; then
-            echo "🚀 First-time setup: Installing Pterodactyl + Tunnel"
-
-            curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
-            chmod +x cloudflared
-            sudo mv cloudflared /usr/local/bin/
-            echo "Starting Cloudflare tunnel..."
-            cloudflared service install ${{ secrets.CF_TUNNEL_TOKEN }}
-
-            echo "🔧 Installing Docker, MariaDB, PHP & dependencies for Pterodactyl"
-            sudo apt update && sudo apt install -y nginx mariadb-server php php-cli php-mysql unzip curl zip git redis-server supervisor
-            curl -Lo panel.tar.gz https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz
-            mkdir -p /var/www/pterodactyl && tar -xzvf panel.tar.gz -C /var/www/pterodactyl --strip-components=1
-            cd /var/www/pterodactyl
-            cp .env.example .env
-            composer install --no-dev --optimize-autoloader
-            php artisan key:generate --force
-            php artisan p:environment:setup --email=admin@example.com --url=https://${{ secrets.CF_RECORD_NAME }}
-            php artisan p:environment:database
-            php artisan migrate --seed --force
-            php artisan p:user:make --email=admin@example.com --username=admin --name-first=Admin --name-last=User --password=StrongPassword123 --admin=1
-            touch /root/.installed
-            echo "✅ Pterodactyl Installed and Cloudflare Tunnel Active."
-          else
-            echo "🔁 Not first-time. Skipping setup."
-          fi
-
-      - name: 📦 Save backup
+      - name: 📦 Backup VPS data before destroy
         run: |
           name="${{ github.event.client_payload.vps_name || 'manual-vps' }}"
-          zip -r ".backup/$name.zip" . -x ".git/*" ".github/*" ".backup/*" || true
+          echo "📦 Creating backup..."
+          mkdir -p .backup-tmp
+          sudo rsync -a --exclude='.git' --exclude='.github' --exclude='.backup' / .backup-tmp/
+          cd .backup-tmp && zip -r "../.backup/$name.zip" .
 
-      - name: 📤 Push
+      - name: 📤 Push backup + SSH info
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "🔁 Updated SSH + backup for ${{ github.event.client_payload.vps_name || 'manual-vps' }}"
+          commit_message: "🔁 Auto backup + SSH for ${{ github.event.client_payload.vps_name || 'manual-vps' }}"
           file_pattern: 'links/*.txt .backup/*.zip'
 
-      - name: 📬 Send Discord Webhook
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      - name: 📩 Send SSH to Discord
         run: |
-          SSH=$(cat links/${{ github.event.client_payload.vps_name || 'manual-vps' }}.txt)
-          curl -H "Content-Type: application/json" -X POST -d "{\"content\":\"🚀 New VPS Ready!\n🔐 SSH: $SSH\n🌐 Panel: https://${{ secrets.CF_RECORD_NAME }}\"}" "$DISCORD_WEBHOOK"
+          SSH=$(cat "links/${{ github.event.client_payload.vps_name || 'manual-vps' }}.txt")
+          curl -X POST "${{ secrets.DISCORD_WEBHOOK }}" \
+            -H "Content-Type: application/json" \
+            -d '{"content": "🆕 New VPS SSH: '"$SSH"'\n🔁 This session will last 6h then auto-recycle."}'
 
-      - name: ⏳ Keep session alive
+      - name: ⏳ Keep alive for 6 hours then cleanup
         run: |
           echo "⏳ Keeping session alive for 6 hours..."
           sleep $((360 * 60))
+
+          echo "🧹 VPS session expired. Cleaning up..."
+          sudo shutdown now
           
